@@ -2,7 +2,7 @@ import os
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings # Librería moderna para embeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 # Configuración de rutas
 DATA_PATH = "data/"
@@ -31,8 +31,8 @@ def split_documents(documents):
 def create_vector_store(chunks):
     print("Iniciando creación de base de datos vectorial...")
     
-    # 1. Definir el modelo de embeddings (all-MiniLM-L6-v2 es rápido y eficiente)
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # 1. Definir el modelo de embeddings
+    embeddings = HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
     
     # 2. Crear y persistir la base de datos en la carpeta especificada
     vector_db = Chroma.from_documents(
