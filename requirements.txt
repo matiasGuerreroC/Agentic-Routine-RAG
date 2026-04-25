@@ -8,6 +8,7 @@ chromadb
 pypdf
 python-dotenv
 sentence-transformers
+einops
 requests
 pymupdf4llm
 tqdm

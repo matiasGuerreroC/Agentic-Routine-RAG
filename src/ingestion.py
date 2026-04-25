@@ -1,4 +1,5 @@
 import os
+import shutil
 import pymupdf4llm
 import pathlib
 from tqdm import tqdm
@@ -55,8 +56,9 @@ def create_vector_store(chunks):
     print(f"Iniciando creación de base de datos vectorial con {len(chunks)} trozos...")
     
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        model_kwargs={'device': device}
+        model_name="nomic-ai/nomic-embed-text-v1.5",
+        model_kwargs={'device': device, 'trust_remote_code': True},
+        encode_kwargs={'normalize_embeddings': True}
     )
     
     # Procesar en lotes para no saturar la memoria y ver progreso
@@ -79,8 +81,10 @@ def create_vector_store(chunks):
     return vector_db
 
 if __name__ == "__main__":
-    # 1. Limpieza opcional: Si quieres empezar de cero absoluto, 
-    # borra manualmente la carpeta 'chromadb_storage' antes de correr esto.
+    # Recrear la DB evita choques de dimensión cuando se cambia de modelo.
+    if os.path.exists(CHROMA_PATH):
+        print(f"Limpiando base vectorial previa en: {CHROMA_PATH}")
+        shutil.rmtree(CHROMA_PATH)
     
     convert_pdfs_to_md()
     docs = load_md_documents()
