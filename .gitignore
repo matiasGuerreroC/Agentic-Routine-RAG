@@ -2,3 +2,4 @@
 venv/
 chromadb_storage/
 data/
+__pycache__/

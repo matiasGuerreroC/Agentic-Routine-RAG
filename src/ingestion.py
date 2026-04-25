@@ -4,6 +4,7 @@ import pymupdf4llm
 import pathlib
 from tqdm import tqdm
 import torch
+from langdetect import detect, LangDetectException
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -49,6 +50,37 @@ def split_documents(documents):
     print(f"Documentos divididos en {len(chunks)} trozos.")
     return chunks
 
+
+def detect_document_language(text):
+    sample = (text or "").strip()[:4000]
+    if len(sample) < 40:
+        return "unknown"
+    try:
+        return detect(sample)
+    except LangDetectException:
+        return "unknown"
+
+
+def filter_english_documents(documents):
+    print("Verificando idioma de Markdown y filtrando solo papers en inglés...")
+    english_docs = []
+    language_count = {}
+
+    for doc in documents:
+        language = detect_document_language(doc.page_content)
+        doc.metadata["language"] = language
+        language_count[language] = language_count.get(language, 0) + 1
+
+        if language == "en":
+            english_docs.append(doc)
+
+    print("Conteo detectado por idioma:")
+    for language, count in sorted(language_count.items(), key=lambda x: x[1], reverse=True):
+        print(f"  - {language}: {count}")
+
+    print(f"Se conservaron {len(english_docs)} documentos en inglés de {len(documents)} totales.")
+    return english_docs
+
 def create_vector_store(chunks):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Usando dispositivo: {device}")
@@ -88,7 +120,8 @@ if __name__ == "__main__":
     
     convert_pdfs_to_md()
     docs = load_md_documents()
-    chunks = split_documents(docs)
+    english_docs = filter_english_documents(docs)
+    chunks = split_documents(english_docs)
     
     if len(chunks) > 0:
         print(f"\nEjemplo del primer trozo (Markdown):\n{chunks[0].page_content[:300]}...")
