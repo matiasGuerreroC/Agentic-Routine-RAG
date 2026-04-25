@@ -72,6 +72,16 @@ def create_llm(
     )
 
 
+def wait_for_continue(prompt: str) -> None:
+    print(prompt)
+    try:
+        import msvcrt
+
+        msvcrt.getch()
+    except ImportError:
+        input()
+
+
 def translate_question_to_english(
     question_spanish: str,
     translator_llm: Optional[ChatGroq] = None,
@@ -242,14 +252,13 @@ class RoutineRAGAgent:
         docs = self._retriever.invoke(question_english)
         return format_docs(docs)
 
-    def generate_routine(self, question_spanish: str, samples: int = 3) -> str:
-        print("[Paso 0] Traduciendo consulta ES -> EN para retrieval semántico...")
-        question_english = self.translate_question(question_spanish)
-
-        print("[Paso 1] Recuperando evidencia desde la base vectorial...")
-        context = self.retrieve_context(question_english)
-
-        print("[Paso 2] Generando múltiples caminos de razonamiento (Self-Consistency)...")
+    def generate_candidates(
+        self,
+        question_spanish: str,
+        question_english: str,
+        context: str,
+        samples: int = 3,
+    ) -> List[str]:
         responses: List[str] = []
         for i in range(samples):
             print(f"   Generando opción {i + 1}...")
@@ -261,17 +270,73 @@ class RoutineRAGAgent:
                 }
             )
             responses.append(clean_qwen_output(raw_response))
+        return responses
 
-        print("\n[Paso 3] Evaluando la opción más segura y consistente (LLM Juez)...")
+    def judge_candidates(self, question_spanish: str, candidates: List[str]) -> str:
+        if len(candidates) < 3:
+            raise ValueError("Se requieren al menos 3 candidatos para la evaluación.")
+
         best_raw = self._judge_chain.invoke(
             {
                 "question_es": question_spanish,
-                "op1": responses[0],
-                "op2": responses[1],
-                "op3": responses[2],
+                "op1": candidates[0],
+                "op2": candidates[1],
+                "op3": candidates[2],
             }
         )
         return clean_qwen_output(best_raw)
+
+    def run_pipeline(self, question_spanish: str, samples: int = 3):
+        question_english = self.translate_question(question_spanish)
+        context = self.retrieve_context(question_english)
+        candidates = self.generate_candidates(
+            question_spanish=question_spanish,
+            question_english=question_english,
+            context=context,
+            samples=samples,
+        )
+        final_answer = self.judge_candidates(question_spanish, candidates)
+        return {
+            "question_spanish": question_spanish,
+            "question_english": question_english,
+            "context": context,
+            "candidates": candidates,
+            "final_answer": final_answer,
+        }
+
+    def generate_routine(self, question_spanish: str, samples: int = 3) -> str:
+        return self.run_pipeline(question_spanish, samples=samples)["final_answer"]
+
+    def run_interactive_console(self, question_spanish: str, samples: int = 3) -> str:
+        print("[Paso 0] Traduciendo consulta ES -> EN para retrieval semántico...")
+        question_english = self.translate_question(question_spanish)
+        print("\nTraducción al inglés:")
+        print(question_english)
+        wait_for_continue("\nPresiona una tecla para continuar al Paso 1...")
+
+        print("\n[Paso 1] Recuperando evidencia desde la base vectorial...")
+        context = self.retrieve_context(question_english)
+        print("\nContexto recuperado:")
+        print(context)
+        wait_for_continue("\nPresiona una tecla para continuar al Paso 2...")
+
+        print("\n[Paso 2] Generando múltiples caminos de razonamiento (Self-Consistency)...")
+        candidates = self.generate_candidates(
+            question_spanish=question_spanish,
+            question_english=question_english,
+            context=context,
+            samples=samples,
+        )
+        for index, candidate in enumerate(candidates, start=1):
+            print(f"\nOpción {index}:")
+            print(candidate)
+        wait_for_continue("\nPresiona una tecla para continuar al Paso 3...")
+
+        print("\n[Paso 3] Evaluando la opción más segura y consistente (LLM Juez)...")
+        final_answer = self.judge_candidates(question_spanish, candidates)
+        print("\nRespuesta final:")
+        print(final_answer)
+        return final_answer
 
 
 def generar_rutina_robusta(
@@ -293,7 +358,8 @@ if __name__ == "__main__":
     """
 
     print("INICIANDO PIPELINE DE AGENTES AVANZADO\n")
-    rutina_final = generar_rutina_robusta(pregunta)
+    agent = RoutineRAGAgent()
+    rutina_final = agent.run_interactive_console(pregunta)
 
     print("\n" + "=" * 60)
     print("RUTINA FINAL GENERADA POR EL AGENTE:")

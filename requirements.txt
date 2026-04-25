@@ -13,3 +13,4 @@ langdetect
 requests
 pymupdf4llm
 tqdm
+streamlit
