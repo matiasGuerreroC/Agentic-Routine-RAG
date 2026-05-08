@@ -56,7 +56,6 @@ def init_state() -> None:
         "stage": 0,
         "samples": 3,
         "rag_triad_evaluation": None,
-        "advanced_mode": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -106,17 +105,11 @@ def main() -> None:
         st.caption("Se usa una evaluación final con self-consistency sobre tres candidatos.")
         
         st.markdown("---")
-        st.subheader("⚙️ Modo Avanzado (RAG 2.0)")
-        st.session_state.advanced_mode = st.checkbox(
-            "Evaluar Tríada de RAG",
-            value=st.session_state.advanced_mode,
-            help="Activa evaluación de Fidelidad, Relevancia de Contexto y Relevancia de Respuesta usando LLM auditor."
+        st.info(
+            "📊 **RAG Avanzado Automático:**\n"
+            "Se evaluarán 3 métricas de calidad (Tríada RAG) automáticamente al finalizar: "
+            "Relevancia Contexto, Fidelidad y Relevancia Respuesta."
         )
-        if st.session_state.advanced_mode:
-            st.info(
-                "📊 Se evaluarán 3 métricas de calidad RAG al finalizar. "
-                "Esto toma ~30s adicionales pero proporciona métricas objetivas."
-            )
 
     with st.form("question_form", clear_on_submit=False):
         question = st.text_area(
@@ -205,38 +198,35 @@ def main() -> None:
     render_step_header(3, "Evaluación final", done=st.session_state.stage > 3)
     if st.session_state.stage >= 3:
         if st.session_state.stage == 3:
-            caption_text = "El juez selecciona la mejor opción de los candidatos generados."
-            if st.session_state.advanced_mode:
-                caption_text += " Luego se evaluará la Tríada de RAG."
-            st.caption(caption_text)
+            st.caption("El juez selecciona la mejor opción de los candidatos generados. Luego se evalúa automáticamente la Tríada RAG.")
             if st.button("Evaluar y finalizar", use_container_width=True):
-                with st.spinner("Evaluando candidatos..."):
+                with st.spinner("Evaluando candidatos y Tríada RAG..."):
                     st.session_state.final_answer = agent.judge_candidates(
                         st.session_state.question_es,
                         st.session_state.candidates,
                     )
 
-                    # Evaluación de Tríada RAG si modo avanzado está activado
-                    if st.session_state.advanced_mode:
-                        with st.spinner("Evaluando Tríada de RAG (esto toma ~30s)..."):
-                            try:
-                                # Extraer docs para evaluación (MQR retorna lista de docs)
-                                docs_list = []
-                                try:
-                                    if hasattr(agent._retriever, 'invoke'):
-                                        docs_list = agent._retriever.invoke(st.session_state.question_en)
-                                except Exception:
-                                    pass
+                    # Evaluación de Tríada RAG siempre se ejecuta
+                    try:
+                        docs_list = []
+                        if hasattr(agent._retriever, 'invoke'):
+                            docs_list = agent._retriever.invoke(st.session_state.question_en)
 
-                                # Evaluar tríada si tenemos docs
-                                if docs_list:
-                                    st.session_state.rag_triad_evaluation = agent.evaluate_rag_triad(
-                                        question_spanish=st.session_state.question_es,
-                                        answer=st.session_state.final_answer,
-                                        docs_retrieved=docs_list,
-                                    )
-                            except Exception as e:
-                                st.warning(f"⚠️ Error en evaluación de Tríada: {str(e)}")
+                        if docs_list:
+                            st.session_state.rag_triad_evaluation = agent.evaluate_rag_triad(
+                                question_spanish=st.session_state.question_es,
+                                answer=st.session_state.final_answer,
+                                docs_retrieved=docs_list,
+                            )
+                        else:
+                            # Si no hay docs, la evaluación heurística se ejecuta igual
+                            st.session_state.rag_triad_evaluation = agent.evaluate_rag_triad(
+                                question_spanish=st.session_state.question_es,
+                                answer=st.session_state.final_answer,
+                                docs_retrieved=[],
+                            )
+                    except Exception as e:
+                        st.warning(f"⚠️ Error en evaluación de Tríada: {str(e)}")
 
                 st.session_state.stage = 4
                 st.rerun()
@@ -244,8 +234,8 @@ def main() -> None:
             st.success("Rutina final lista.")
             st.markdown(st.session_state.final_answer)
 
-            # Mostrar métricas de Tríada RAG si está disponible
-            if st.session_state.rag_triad_evaluation and st.session_state.advanced_mode:
+            # Mostrar métricas de Tríada RAG (siempre disponible)
+            if st.session_state.rag_triad_evaluation:
                 st.markdown("---")
                 st.subheader("📊 Evaluación de Calidad RAG (Tríada)")
 

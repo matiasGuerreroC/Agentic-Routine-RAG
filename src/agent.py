@@ -31,9 +31,62 @@ DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 MAX_CONTEXT_DOCS = 6  # número máximo de documentos a incluir en el contexto
 DOC_SNIPPET_CHARS = 1200  # caracteres por documento para el snippet
 
+# Límites aún más estrictos para evaluación de Tríada RAG (auditor es costoso en tokens)
+MAX_TRIAD_CONTEXT_DOCS = 2  # solo top 2 docs para auditor
+TRIAD_SNIPPET_CHARS = 600  # snippet muy corto para auditor
+
 
 def clean_qwen_output(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """Intenta extraer un JSON válido de un texto.
+    
+    Busca dentro de llaves { } y maneja respuestas parcialmente malformadas.
+    """
+    import json
+    
+    # Primero, intentar parsear directamente (caso ideal)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Buscar JSON entre llaves {} en el texto
+    start_idx = text.find('{')
+    if start_idx == -1:
+        return None
+    
+    # Encontrar la posición de cierre más probable
+    for end_idx in range(len(text), start_idx, -1):
+        if text[end_idx - 1] == '}':
+            try:
+                candidate = text[start_idx:end_idx]
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    
+    return None
+
+
+def compress_context_for_triad(docs: List[Document]) -> str:
+    """Comprime contexto de forma extrema para auditor LLM (limita tokens).
+    
+    Solo toma los top 2 docs y los recorta a snippets muy pequeños.
+    """
+    try:
+        top_docs = docs[:MAX_TRIAD_CONTEXT_DOCS]
+    except Exception:
+        top_docs = docs
+    
+    shortened_docs = []
+    for d in top_docs:
+        snippet = (d.page_content[:TRIAD_SNIPPET_CHARS] + "...") if len(d.page_content) > TRIAD_SNIPPET_CHARS else d.page_content
+        doc_copy = Document(page_content=snippet, metadata=d.metadata)
+        shortened_docs.append(doc_copy)
+    
+    return format_docs(shortened_docs)
 
 
 def format_docs(docs: List[Document]) -> str:
@@ -197,13 +250,14 @@ TU RESPUESTA (en español, incluye ANÁLISIS seguido de las 3 secciones):
 """
 
 JUDGE_TEMPLATE = """
-Eres un supervisor clínico-deportivo. Revisa estas 3 opciones de rutina generadas para la siguiente petición:
-PREGUNTA DEL USUARIO: "{question_es}"
+Eres un supervisor clínico-deportivo experto. Tu tarea es elegir la MEJOR rutina de las 3 opciones.
 
-Evalúa estrictamente:
-1. ¿Respeta exactamente el equipamiento disponible?
-2. ¿Es la más segura respecto a los dolores mencionados?
-3. ¿Tiene formato Markdown limpio?
+Criterios de evaluación (en orden de importancia):
+1. SEGURIDAD: ¿Respeta lesiones/dolores mencionados? ¿Usa solo el equipo disponible?
+2. CALIDAD: ¿Es científicamente rigurosa? ¿Tiene parámetros (series, reps, descanso)?
+3. CLARIDAD: ¿Formato Markdown limpio? ¿Es entendible?
+
+PREGUNTA DEL USUARIO: "{question_es}"
 
 OPCIÓN 1:
 {op1}
@@ -214,35 +268,38 @@ OPCIÓN 2:
 OPCIÓN 3:
 {op3}
 
-Devuelve ÚNICAMENTE el texto completo de la MEJOR OPCIÓN, sin agregar comentarios tuyos al principio ni al final.
+Análisis:
+1. ¿Cuál respeta mejor la seguridad?
+2. ¿Cuál tiene mejor calidad científica?
+3. ¿Cuál es más clara?
+
+Devuelve ÚNICAMENTE el número (1, 2 o 3) de la mejor opción seguido del texto completo de esa rutina, sin comentarios adicionales.
+Formato: [NÚMERO]\n[RUTINA COMPLETA]
 """
 
 # Template para evaluación de la Tríada de RAG
-TRIAD_EVALUATION_TEMPLATE = """
-Actúa como un Auditor Crítico de Sistemas RAG. Tu tarea es evaluar la calidad de una respuesta basada en la Tríada de RAG.
+TRIAD_EVALUATION_TEMPLATE = """Eres un Auditor Crítico de Sistemas RAG. Evalúa esta respuesta usando la Tríada de RAG.
 
-CRITERIOS DE EVALUACIÓN (Escala 1 a 5):
-1. RELEVANCIA DEL CONTEXTO: ¿Los documentos recuperados contienen la información necesaria para responder?
-2. FIDELIDAD (Faithfulness): ¿La respuesta se basa estrictamente en el contexto (sin inventar hechos)?
-3. RELEVANCIA DE LA RESPUESTA: ¿La respuesta soluciona directamente la duda del usuario?
+CRITERIOS (escala 1-5):
+1. Relevancia Contexto: ¿Los docs tienen la info necesaria?
+2. Fidelidad: ¿La respuesta cita el contexto sin inventar?
+3. Relevancia Respuesta: ¿Contesta directamente la pregunta?
 
-DATOS A EVALUAR:
-- PREGUNTA DEL USUARIO: {question_es}
-- CONTEXTO RECUPERADO: {context}
-- RESPUESTA DEL SISTEMA: {answer}
+PREGUNTA: {question_es}
+CONTEXTO: {context}
+RESPUESTA: {answer}
 
-Responde en formato JSON con esta estructura:
+Responde SOLO con JSON válido, sin texto adicional:
 {{
-  "relevancia_contexto": {número 1-5},
+  "relevancia_contexto": (1-5),
   "justificacion_contexto": "texto breve",
-  "fidelidad": {número 1-5},
+  "fidelidad": (1-5),
   "justificacion_fidelidad": "texto breve",
-  "relevancia_respuesta": {número 1-5},
+  "relevancia_respuesta": (1-5),
   "justificacion_respuesta": "texto breve",
-  "score_general": {número 1-5},
-  "recomendaciones": "observaciones clave"
-}}
-"""
+  "score_general": (1-5),
+  "recomendaciones": "observaciones"
+}}"""
 
 # Template para Multi-Query Retrieval
 MQR_TEMPLATE = """
@@ -288,10 +345,16 @@ class RoutineRAGAgent:
             model_name=self.llm_model_name,
         )
         # LLM auditor para evaluación de Tríada (Llama 3.3 70B es más riguroso)
-        self._llm_auditor = create_llm(
-            temperature=0.0,
-            model_name="llama-3.3-70b-versatile",  # Auditor más potente
-        )
+        # Intentar crear un auditor potente; si falla, caer al LLM juez para
+        # no romper la ejecución (por ejemplo si el modelo no está disponible).
+        try:
+            self._llm_auditor = create_llm(
+                temperature=0.0,
+                model_name="llama-3.3-70b-versatile",  # Auditor más potente
+            )
+        except Exception as e:
+            print(f"⚠️ No se pudo crear LLM auditor especializado ({e}), usando LLM juez como fallback.")
+            self._llm_auditor = self._llm_judge
         
         # Integrar Multi-Query Retrieval (MQR)
         mqr_prompt = ChatPromptTemplate.from_template(MQR_TEMPLATE)
@@ -317,11 +380,15 @@ class RoutineRAGAgent:
             | StrOutputParser()
         )
         # Chain para evaluación de Tríada
-        self._triad_chain = (
-            ChatPromptTemplate.from_template(TRIAD_EVALUATION_TEMPLATE)
-            | self._llm_auditor
-            | StrOutputParser()
-        )
+        try:
+            self._triad_chain = (
+                ChatPromptTemplate.from_template(TRIAD_EVALUATION_TEMPLATE)
+                | self._llm_auditor
+                | StrOutputParser()
+            )
+        except Exception as e:
+            print(f"⚠️ No se pudo crear triad_chain ({e}). La evaluación LLM de la Tríada se deshabilita (fallback heurístico).")
+            self._triad_chain = None
 
     def translate_question(self, question_spanish: str) -> str:
         return translate_question_to_english(
@@ -439,9 +506,35 @@ class RoutineRAGAgent:
                     "op3": candidates[2],
                 }
             )
-            return clean_qwen_output(best_raw)
+            best_clean = clean_qwen_output(best_raw)
+            
+            # Intentar extraer el número de candidato (1, 2 o 3) del inicio de la respuesta
+            import re
+            match = re.search(r'\[?([123])\]?', best_clean)
+            if match:
+                candidate_num = int(match.group(1))
+                print(f"   Juez eligió opción {candidate_num}")
+            else:
+                # Si no hay número explícito, asumir que la respuesta es la rutina elegida
+                # (asume formato antiguo)
+                print("   Juez devolvió respuesta sin número explícito; usando como está")
+                return best_clean
+            
+            # Extraer la rutina después del número
+            # Buscar dónde empieza la rutina (después del número y saltos de línea)
+            parts = best_clean.split('\n', 1)
+            if len(parts) > 1:
+                routine = parts[1].strip()
+            else:
+                # Si no hay salto de línea, usar lo que viene después del número
+                routine = best_clean.split('[' + str(candidate_num) + ']', 1)[-1].strip()
+                if not routine:
+                    routine = candidates[candidate_num - 1]
+            
+            return routine if routine else candidates[candidate_num - 1]
+            
         except Exception as e:
-            # Fallback: retornar el primero si hay error de Rate Limit
+            # Fallback: retornar el primero si hay error
             print(f"⚠️ Error en judge_candidates: {str(e)}. Usando opción 1.")
             return candidates[0]
 
@@ -459,57 +552,130 @@ class RoutineRAGAgent:
         
         Retorna un diccionario con puntuaciones y justificaciones.
         """
-        # Formatear contexto
-        context_formatted = format_docs(docs_retrieved)
-        
-        try:
-            evaluation_raw = self._triad_chain.invoke(
-                {
-                    "question_es": question_spanish,
-                    "context": context_formatted,
-                    "answer": answer,
-                }
-            )
-            evaluation_clean = clean_qwen_output(evaluation_raw)
-            
-            # Intentar parsear como JSON
-            import json
+        # Formatear contexto comprimido (muy pequeño para auditor)
+        if docs_retrieved:
+            context_formatted = compress_context_for_triad(docs_retrieved)
+        else:
+            context_formatted = "[Sin contexto]"
+
+        # Si tenemos triad_chain LLM, intentamos usarla; si falla, aplicamos
+        # una evaluación heurística ligera para no devolver todos ceros.
+        if self._triad_chain is not None:
             try:
-                evaluation_dict = json.loads(evaluation_clean)
-            except json.JSONDecodeError:
-                # Fallback: retornar estructura genérica
-                evaluation_dict = {
-                    "relevancia_contexto": 3,
-                    "justificacion_contexto": "No se pudo evaluar",
-                    "fidelidad": 3,
-                    "justificacion_fidelidad": "No se pudo evaluar",
-                    "relevancia_respuesta": 3,
-                    "justificacion_respuesta": "No se pudo evaluar",
-                    "score_general": 3,
-                    "recomendaciones": "Evaluación automática falló",
-                }
-            
-            return evaluation_dict
+                evaluation_raw = self._triad_chain.invoke(
+                    {
+                        "question_es": question_spanish,
+                        "context": context_formatted,
+                        "answer": answer,
+                    }
+                )
+                evaluation_clean = clean_qwen_output(evaluation_raw)
+
+                # Intentar parsear JSON con extracción robusta
+                evaluation_dict = extract_json_from_text(evaluation_clean)
+                
+                if evaluation_dict is not None:
+                    # JSON extraído exitosamente; validar que tiene campos requeridos
+                    required_fields = {
+                        "relevancia_contexto", "fidelidad", "relevancia_respuesta",
+                        "score_general", "justificacion_contexto", "justificacion_fidelidad",
+                        "justificacion_respuesta", "recomendaciones"
+                    }
+                    if not all(field in evaluation_dict for field in required_fields):
+                        # JSON válido pero incompleto; rellenar campos faltantes
+                        print("⚠️ JSON auditor incompleto; rellenando campos faltantes.")
+                        defaults = {
+                            "relevancia_contexto": 3, "justificacion_contexto": "No disponible",
+                            "fidelidad": 3, "justificacion_fidelidad": "No disponible",
+                            "relevancia_respuesta": 3, "justificacion_respuesta": "No disponible",
+                            "score_general": 3, "recomendaciones": "Respuesta parcial del auditor",
+                        }
+                        evaluation_dict = {**defaults, **evaluation_dict}
+                    return evaluation_dict
+                else:
+                    # No se pudo extraer JSON; recurrir a heurística
+                    print(f"⚠️ No se pudo extraer JSON de respuesta auditor. Texto: {evaluation_clean[:200]}")
+                    print("⚠️ Usando evaluación heurística fallback.")
+                    
+            except Exception as e:
+                print(f"⚠️ Error en evaluate_rag_triad (auditor LLM): {str(e)}. Usando evaluación heurística fallback.")
+
+        # Evaluación heurística fallback (cuando LLM auditor no está disponible)
+        try:
+            # Heurísticas simples por aparición de tokens relevantes
+            import re
+
+            def words(text: str):
+                return re.findall(r"\w+", text.lower())
+
+            stopwords = {
+                "el","la","los","las","y","o","de","del","que","en","por","con",
+                "a","un","una","para","se","es","su","al","lo","como","mas",
+            }
+
+            ctx_words = [w for w in words(context_formatted) if w not in stopwords]
+            ans_words = [w for w in words(answer) if w not in stopwords]
+            ques_words = [w for w in words(question_spanish) if w not in stopwords]
+
+            # Relevancia del contexto: cuántas palabras del contexto aparecen en la respuesta
+            ctx_set = set(ctx_words)
+            match_ctx = sum(1 for w in ans_words if w in ctx_set)
+            relevancia_contexto = min(5, max(1, int((match_ctx / max(1, min(60, len(ans_words)))) * 5)))
+
+            # Fidelidad: penalizar si la respuesta incluye muchas palabras que no vienen del contexto
+            non_ctx_in_answer = sum(1 for w in ans_words if w not in ctx_set)
+            fidelity_ratio = 1 - (non_ctx_in_answer / max(1, len(ans_words)))
+            fidelidad = min(5, max(1, int(fidelity_ratio * 5)))
+
+            # Relevancia de la respuesta: comparación con la pregunta (overlap)
+            ques_set = set(ques_words)
+            match_ques = sum(1 for w in ans_words if w in ques_set)
+            relevancia_respuesta = min(5, max(1, int((match_ques / max(1, len(ques_words))) * 5)))
+
+            score_general = round((relevancia_contexto + fidelidad + relevancia_respuesta) / 3)
+
+            just_ctx = f"{match_ctx} tokens del contexto aparecen en la respuesta."
+            just_fid = f"{non_ctx_in_answer} tokens en la respuesta sin evidencia directa en el contexto."
+            just_resp = f"{match_ques} tokens de la pregunta aparecen en la respuesta."
+
+            recommendations = []
+            if relevancia_contexto <= 2:
+                recommendations.append("Mejorar retrieval: aumentar docs/reducir ruido o activar resumen del contexto.")
+            if fidelidad <= 2:
+                recommendations.append("Revisar la respuesta: puede contener afirmaciones no soportadas por el contexto.")
+            if relevancia_respuesta <= 2:
+                recommendations.append("La respuesta puede no abordar directamente la pregunta; ajustar prompt o contexto.")
+
+            return {
+                "relevancia_contexto": relevancia_contexto,
+                "justificacion_contexto": just_ctx,
+                "fidelidad": fidelidad,
+                "justificacion_fidelidad": just_fid,
+                "relevancia_respuesta": relevancia_respuesta,
+                "justificacion_respuesta": just_resp,
+                "score_general": score_general,
+                "recomendaciones": " ".join(recommendations) if recommendations else "Sin observaciones",
+            }
+
         except Exception as e:
-            print(f"⚠️ Error en evaluate_rag_triad: {str(e)}")
+            print(f"⚠️ Error en evaluación heurística de Tríada: {str(e)}")
             return {
                 "error": str(e),
                 "score_general": 0,
                 "recomendaciones": "Evaluación no disponible",
             }
 
-    def run_pipeline(self, question_spanish: str, samples: int = 3, include_rag_triad: bool = True):
+    def run_pipeline(self, question_spanish: str, samples: int = 3):
         """
-        Pipeline completo con Multi-Query Retrieval y evaluación opcional de Tríada RAG.
+        Pipeline completo con Multi-Query Retrieval y evaluación de Tríada RAG.
         
         Args:
             question_spanish: Pregunta del usuario en español
             samples: Número de candidatos a generar (default: 3)
-            include_rag_triad: Si True, incluir evaluación de la Tríada de RAG
             
         Returns:
             Dict con question_spanish, question_english, context, candidates, final_answer,
-            y opcionalmente rag_triad_evaluation
+            y rag_triad_evaluation
         """
         # Paso 0: Traducir
         question_english = self.translate_question(question_spanish)
@@ -540,7 +706,7 @@ class RoutineRAGAgent:
         # Paso 3: Juicio sobre candidatos
         final_answer = self.judge_candidates(question_spanish, candidates)
         
-        # Paso 4: Evaluación de Tríada RAG (opcional, para reportes)
+        # Paso 4: Evaluación de Tríada RAG (siempre incluida)
         result = {
             "question_spanish": question_spanish,
             "question_english": question_english,
@@ -549,18 +715,25 @@ class RoutineRAGAgent:
             "final_answer": final_answer,
         }
         
-        if include_rag_triad and docs_list:
+        if docs_list:
             result["rag_triad_evaluation"] = self.evaluate_rag_triad(
                 question_spanish=question_spanish,
                 answer=final_answer,
                 docs_retrieved=docs_list,
             )
+        else:
+            # Si no hay docs, usar evaluación heurística con respuesta y pregunta solas
+            result["rag_triad_evaluation"] = self.evaluate_rag_triad(
+                question_spanish=question_spanish,
+                answer=final_answer,
+                docs_retrieved=[],  # Lista vacía dispara heurística directa
+            )
         
         return result
 
-    def generate_routine(self, question_spanish: str, samples: int = 3, include_rag_triad: bool = False) -> str:
+    def generate_routine(self, question_spanish: str, samples: int = 3) -> str:
         """Genera una rutina basada en la pregunta del usuario."""
-        return self.run_pipeline(question_spanish, samples=samples, include_rag_triad=include_rag_triad)["final_answer"]
+        return self.run_pipeline(question_spanish, samples=samples)["final_answer"]
 
     def run_interactive_console(self, question_spanish: str, samples: int = 3) -> str:
         """
