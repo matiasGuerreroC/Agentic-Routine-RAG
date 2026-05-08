@@ -1,9 +1,12 @@
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from time import sleep
 
 import torch
+import logging
+import random
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -11,12 +14,22 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 
 load_dotenv()
+
+# Reducir ruido de logs de transformers en backend
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("langchain").setLevel(logging.WARNING)
 
 CHROMA_PATH = "chromadb_storage"
 DEFAULT_LLM_MODEL = "qwen/qwen3-32b"
 DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+
+# Control para limitar tamaño de contexto enviado al LLM (evita rate limits por tokens)
+MAX_CONTEXT_DOCS = 6  # número máximo de documentos a incluir en el contexto
+DOC_SNIPPET_CHARS = 1200  # caracteres por documento para el snippet
 
 
 def clean_qwen_output(text: str) -> str:
@@ -204,6 +217,46 @@ OPCIÓN 3:
 Devuelve ÚNICAMENTE el texto completo de la MEJOR OPCIÓN, sin agregar comentarios tuyos al principio ni al final.
 """
 
+# Template para evaluación de la Tríada de RAG
+TRIAD_EVALUATION_TEMPLATE = """
+Actúa como un Auditor Crítico de Sistemas RAG. Tu tarea es evaluar la calidad de una respuesta basada en la Tríada de RAG.
+
+CRITERIOS DE EVALUACIÓN (Escala 1 a 5):
+1. RELEVANCIA DEL CONTEXTO: ¿Los documentos recuperados contienen la información necesaria para responder?
+2. FIDELIDAD (Faithfulness): ¿La respuesta se basa estrictamente en el contexto (sin inventar hechos)?
+3. RELEVANCIA DE LA RESPUESTA: ¿La respuesta soluciona directamente la duda del usuario?
+
+DATOS A EVALUAR:
+- PREGUNTA DEL USUARIO: {question_es}
+- CONTEXTO RECUPERADO: {context}
+- RESPUESTA DEL SISTEMA: {answer}
+
+Responde en formato JSON con esta estructura:
+{{
+  "relevancia_contexto": {número 1-5},
+  "justificacion_contexto": "texto breve",
+  "fidelidad": {número 1-5},
+  "justificacion_fidelidad": "texto breve",
+  "relevancia_respuesta": {número 1-5},
+  "justificacion_respuesta": "texto breve",
+  "score_general": {número 1-5},
+  "recomendaciones": "observaciones clave"
+}}
+"""
+
+# Template para Multi-Query Retrieval
+MQR_TEMPLATE = """
+Eres un experto en ciencias del deporte. Tu tarea es generar 3 versiones diferentes de la pregunta dada
+en inglés técnico para recuperar documentos relevantes de una base de datos científica.
+
+Enfatiza términos técnicos como: 'hypertrophy', 'mechanical tension', 'range of motion', 
+'progressive overload', 'muscular endurance', 'strength training'.
+
+Pregunta original en español: {question}
+
+Genera EXACTAMENTE 3 variantes en inglés técnico, una por línea, sin numeración ni explicación:
+"""
+
 
 @dataclass
 class RoutineRAGAgent:
@@ -213,11 +266,15 @@ class RoutineRAGAgent:
 
     def __post_init__(self) -> None:
         self._embeddings = get_embeddings()
-        self._retriever = get_retriever(
+        
+        # Configurar retriever base
+        db = get_vector_store(
             chroma_path=self.chroma_path,
-            embedding_function=self._embeddings,
-            k=self.k,
+            embedding_function=self._embeddings
         )
+        retriever_base = db.as_retriever(search_kwargs={"k": self.k})
+        
+        # Configurar LLMs
         self._llm_generator = create_llm(
             temperature=0.4,
             model_name=self.llm_model_name,
@@ -230,7 +287,25 @@ class RoutineRAGAgent:
             temperature=0.0,
             model_name=self.llm_model_name,
         )
-
+        # LLM auditor para evaluación de Tríada (Llama 3.3 70B es más riguroso)
+        self._llm_auditor = create_llm(
+            temperature=0.0,
+            model_name="llama-3.3-70b-versatile",  # Auditor más potente
+        )
+        
+        # Integrar Multi-Query Retrieval (MQR)
+        mqr_prompt = ChatPromptTemplate.from_template(MQR_TEMPLATE)
+        try:
+            self._retriever = MultiQueryRetriever.from_llm(
+                retriever=retriever_base,
+                llm=self._llm_translator,
+                prompt=mqr_prompt,
+            )
+        except Exception as e:
+            print(f"⚠️ Advertencia: MQR no disponible ({str(e)}). Usando retriever base.")
+            self._retriever = retriever_base
+        
+        # Chains para generación y juicio
         self._generator_chain = (
             ChatPromptTemplate.from_template(GENERATOR_TEMPLATE)
             | self._llm_generator
@@ -241,6 +316,12 @@ class RoutineRAGAgent:
             | self._llm_judge
             | StrOutputParser()
         )
+        # Chain para evaluación de Tríada
+        self._triad_chain = (
+            ChatPromptTemplate.from_template(TRIAD_EVALUATION_TEMPLATE)
+            | self._llm_auditor
+            | StrOutputParser()
+        )
 
     def translate_question(self, question_spanish: str) -> str:
         return translate_question_to_english(
@@ -249,8 +330,34 @@ class RoutineRAGAgent:
         )
 
     def retrieve_context(self, question_english: str) -> str:
-        docs = self._retriever.invoke(question_english)
-        return format_docs(docs)
+        """Recupera contexto usando Multi-Query Retrieval (MQR).
+        
+        MQR automáticamente genera 3 variantes de la pregunta en inglés técnico
+        antes de hacer búsqueda semántica, mejorando la calidad del retrieval.
+        """
+        try:
+            docs = self._retriever.invoke(question_english)
+            # Acortar el contexto: tomar sólo los primeros N documentos y recortar
+            # cada documento a un snippet de longitud controlada. Esto reduce el
+            # tamaño del prompt y ayuda a evitar límites de tokens / rate limits.
+            try:
+                top_docs = docs[:MAX_CONTEXT_DOCS]
+            except Exception:
+                top_docs = docs
+
+            # Crear copias con snippets recortados
+            shortened_docs = []
+            for d in top_docs:
+                # A veces `page_content` puede ser muy grande; recortamos para el prompt
+                snippet = (d.page_content[:DOC_SNIPPET_CHARS] + "...") if len(d.page_content) > DOC_SNIPPET_CHARS else d.page_content
+                # Crear un Document-like dict para formatear
+                doc_copy = Document(page_content=snippet, metadata=d.metadata)
+                shortened_docs.append(doc_copy)
+
+            return format_docs(shortened_docs)
+        except Exception as e:
+            print(f"⚠️ Error en retrieve_context: {str(e)}")
+            return "[Error: No se pudo recuperar contexto]"
 
     def generate_candidates(
         self,
@@ -259,68 +366,229 @@ class RoutineRAGAgent:
         context: str,
         samples: int = 3,
     ) -> List[str]:
+        """Genera múltiples candidatos de rutina (Self-Consistency).
+        
+        Implementa reintentos automáticos para manejar Rate Limits de Groq.
+        """
         responses: List[str] = []
+        max_retries = 5
+
         for i in range(samples):
-            print(f"   Generando opción {i + 1}...")
-            raw_response = self._generator_chain.invoke(
-                {
-                    "context": context,
-                    "question_es": question_spanish,
-                    "question_en": question_english,
-                }
-            )
-            responses.append(clean_qwen_output(raw_response))
+            print(f"   Generando opción {i + 1}/{samples}...")
+
+            for attempt in range(max_retries):
+                try:
+                    raw_response = self._generator_chain.invoke(
+                        {
+                            "context": context,
+                            "question_es": question_spanish,
+                            "question_en": question_english,
+                        }
+                    )
+                    responses.append(clean_qwen_output(raw_response))
+                    break  # Salir del loop de reintentos
+
+                except Exception as e:
+                    error_msg = str(e)
+                    # Detectar Rate Limit o errores de red y aplicar backoff con jitter
+                    if "rate_limit" in error_msg.lower() or "429" in error_msg:
+                        base = 10
+                        wait_time = base * (2 ** attempt) + random.uniform(0, 3)
+                        print(f"   ⏳ Rate Limit detectado. Esperando {int(wait_time)}s (attempt {attempt + 1})...")
+                        sleep(wait_time)
+                    else:
+                        # Backoff más corto para otros errores
+                        wait_time = 2 * (attempt + 1) + random.uniform(0, 1)
+                        print(f"   ⚠️ Error generando opción {i + 1} (attempt {attempt + 1}): {error_msg}. Esperando {int(wait_time)}s antes de reintentar.")
+                        sleep(wait_time)
+
+                    # Si es el último intento y no se pudo generar, añadir marcador de error
+                    if attempt == max_retries - 1:
+                        print(f"   ⚠️ Último intento fallido para opción {i + 1}: {error_msg}")
+                        responses.append("[Error al generar rutina]")
+
+        # Si no se generaron suficientes candidatos, rellenar con duplicados del primero
+        if len(responses) < samples:
+            if responses:
+                last = responses[-1]
+                while len(responses) < samples:
+                    responses.append(last + "\n\n[Fallback duplicado por fallo de generación]")
+            else:
+                while len(responses) < samples:
+                    responses.append("[Error al generar rutina]")
+
         return responses
 
     def judge_candidates(self, question_spanish: str, candidates: List[str]) -> str:
+        """Evalúa 3 candidatos y retorna el mejor usando LLM Juez."""
+        # Aceptar listas con menos de 3 candidatos rellenando con duplicados
         if len(candidates) < 3:
-            raise ValueError("Se requieren al menos 3 candidatos para la evaluación.")
+            if candidates:
+                while len(candidates) < 3:
+                    candidates.append(candidates[-1])
+            else:
+                # No hay candidatos, retornar marcador de error
+                return "[Error: no se generaron candidatos]"
 
-        best_raw = self._judge_chain.invoke(
-            {
-                "question_es": question_spanish,
-                "op1": candidates[0],
-                "op2": candidates[1],
-                "op3": candidates[2],
+        try:
+            best_raw = self._judge_chain.invoke(
+                {
+                    "question_es": question_spanish,
+                    "op1": candidates[0],
+                    "op2": candidates[1],
+                    "op3": candidates[2],
+                }
+            )
+            return clean_qwen_output(best_raw)
+        except Exception as e:
+            # Fallback: retornar el primero si hay error de Rate Limit
+            print(f"⚠️ Error en judge_candidates: {str(e)}. Usando opción 1.")
+            return candidates[0]
+
+    def evaluate_rag_triad(
+        self,
+        question_spanish: str,
+        answer: str,
+        docs_retrieved: List[Document],
+    ) -> Dict[str, Any]:
+        """
+        Evalúa la respuesta según la Tríada de RAG:
+        - Relevancia del Contexto
+        - Fidelidad (Faithfulness)
+        - Relevancia de la Respuesta
+        
+        Retorna un diccionario con puntuaciones y justificaciones.
+        """
+        # Formatear contexto
+        context_formatted = format_docs(docs_retrieved)
+        
+        try:
+            evaluation_raw = self._triad_chain.invoke(
+                {
+                    "question_es": question_spanish,
+                    "context": context_formatted,
+                    "answer": answer,
+                }
+            )
+            evaluation_clean = clean_qwen_output(evaluation_raw)
+            
+            # Intentar parsear como JSON
+            import json
+            try:
+                evaluation_dict = json.loads(evaluation_clean)
+            except json.JSONDecodeError:
+                # Fallback: retornar estructura genérica
+                evaluation_dict = {
+                    "relevancia_contexto": 3,
+                    "justificacion_contexto": "No se pudo evaluar",
+                    "fidelidad": 3,
+                    "justificacion_fidelidad": "No se pudo evaluar",
+                    "relevancia_respuesta": 3,
+                    "justificacion_respuesta": "No se pudo evaluar",
+                    "score_general": 3,
+                    "recomendaciones": "Evaluación automática falló",
+                }
+            
+            return evaluation_dict
+        except Exception as e:
+            print(f"⚠️ Error en evaluate_rag_triad: {str(e)}")
+            return {
+                "error": str(e),
+                "score_general": 0,
+                "recomendaciones": "Evaluación no disponible",
             }
-        )
-        return clean_qwen_output(best_raw)
 
-    def run_pipeline(self, question_spanish: str, samples: int = 3):
+    def run_pipeline(self, question_spanish: str, samples: int = 3, include_rag_triad: bool = True):
+        """
+        Pipeline completo con Multi-Query Retrieval y evaluación opcional de Tríada RAG.
+        
+        Args:
+            question_spanish: Pregunta del usuario en español
+            samples: Número de candidatos a generar (default: 3)
+            include_rag_triad: Si True, incluir evaluación de la Tríada de RAG
+            
+        Returns:
+            Dict con question_spanish, question_english, context, candidates, final_answer,
+            y opcionalmente rag_triad_evaluation
+        """
+        # Paso 0: Traducir
         question_english = self.translate_question(question_spanish)
+        
+        # Paso 1: Retrieval con MQR (genera variantes automáticamente)
         context = self.retrieve_context(question_english)
+        
+        # Extraer docs para evaluación (requiere acceso a docs_list si es MQR)
+        docs_list = []
+        try:
+            if isinstance(self._retriever, MultiQueryRetriever):
+                # Para MQR, hacemos un invoke directo para obtener docs
+                docs_list = self._retriever.invoke(question_english)
+            else:
+                # Para retriever base
+                docs_list = self._retriever.invoke(question_english)
+        except:
+            pass  # Si falla, continuamos sin docs_list para evaluación
+        
+        # Paso 2: Generación de candidatos
         candidates = self.generate_candidates(
             question_spanish=question_spanish,
             question_english=question_english,
             context=context,
             samples=samples,
         )
+        
+        # Paso 3: Juicio sobre candidatos
         final_answer = self.judge_candidates(question_spanish, candidates)
-        return {
+        
+        # Paso 4: Evaluación de Tríada RAG (opcional, para reportes)
+        result = {
             "question_spanish": question_spanish,
             "question_english": question_english,
             "context": context,
             "candidates": candidates,
             "final_answer": final_answer,
         }
+        
+        if include_rag_triad and docs_list:
+            result["rag_triad_evaluation"] = self.evaluate_rag_triad(
+                question_spanish=question_spanish,
+                answer=final_answer,
+                docs_retrieved=docs_list,
+            )
+        
+        return result
 
-    def generate_routine(self, question_spanish: str, samples: int = 3) -> str:
-        return self.run_pipeline(question_spanish, samples=samples)["final_answer"]
+    def generate_routine(self, question_spanish: str, samples: int = 3, include_rag_triad: bool = False) -> str:
+        """Genera una rutina basada en la pregunta del usuario."""
+        return self.run_pipeline(question_spanish, samples=samples, include_rag_triad=include_rag_triad)["final_answer"]
 
     def run_interactive_console(self, question_spanish: str, samples: int = 3) -> str:
+        """
+        Consola interactiva que muestra los pasos del pipeline RAG avanzado:
+        0. Traducción (ES -> EN)
+        1. Multi-Query Retrieval (generación de variantes técnicas)
+        2. Recuperación de evidencia científica
+        3. Generación de múltiples caminos (Self-Consistency)
+        4. Evaluación y selección del mejor (LLM Juez)
+        """
         print("[Paso 0] Traduciendo consulta ES -> EN para retrieval semántico...")
         question_english = self.translate_question(question_spanish)
-        print("\nTraducción al inglés:")
-        print(question_english)
+        print(f"\nTraducción al inglés:\n{question_english}")
         wait_for_continue("\nPresiona una tecla para continuar al Paso 1...")
 
-        print("\n[Paso 1] Recuperando evidencia desde la base vectorial...")
+        print(
+            "\n[Paso 1] Multi-Query Retrieval: Generando variantes técnicas en inglés..."
+        )
+        print("El sistema generará 3 formas distintas de preguntar lo mismo,")
+        print("asegurando que encuentre la mejor evidencia disponible.\n")
         context = self.retrieve_context(question_english)
-        print("\nContexto recuperado:")
-        print(context)
+        print("Contexto recuperado (primeras 500 caracteres):")
+        print(context[:500] + "...")
         wait_for_continue("\nPresiona una tecla para continuar al Paso 2...")
 
-        print("\n[Paso 2] Generando múltiples caminos de razonamiento (Self-Consistency)...")
+        print(
+            "\n[Paso 2] Generando múltiples caminos de razonamiento (Self-Consistency)..."
+        )
         candidates = self.generate_candidates(
             question_spanish=question_spanish,
             question_english=question_english,
@@ -329,10 +597,12 @@ class RoutineRAGAgent:
         )
         for index, candidate in enumerate(candidates, start=1):
             print(f"\nOpción {index}:")
-            print(candidate)
+            print(candidate[:400] + "...\n")
         wait_for_continue("\nPresiona una tecla para continuar al Paso 3...")
 
-        print("\n[Paso 3] Evaluando la opción más segura y consistente (LLM Juez)...")
+        print(
+            "\n[Paso 3] Evaluando la opción más segura y consistente (LLM Juez)..."
+        )
         final_answer = self.judge_candidates(question_spanish, candidates)
         print("\nRespuesta final:")
         print(final_answer)

@@ -55,6 +55,8 @@ def init_state() -> None:
         "final_answer": "",
         "stage": 0,
         "samples": 3,
+        "rag_triad_evaluation": None,
+        "advanced_mode": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -69,6 +71,7 @@ def reset_pipeline(question: str, samples: int) -> None:
     st.session_state.final_answer = ""
     st.session_state.stage = 0
     st.session_state.samples = samples
+    st.session_state.rag_triad_evaluation = None
 
 
 def render_step_header(number: int, title: str, done: bool = False) -> None:
@@ -101,6 +104,19 @@ def main() -> None:
         samples = 3
         st.markdown("**Cantidad de candidatos:** 3")
         st.caption("Se usa una evaluación final con self-consistency sobre tres candidatos.")
+        
+        st.markdown("---")
+        st.subheader("⚙️ Modo Avanzado (RAG 2.0)")
+        st.session_state.advanced_mode = st.checkbox(
+            "Evaluar Tríada de RAG",
+            value=st.session_state.advanced_mode,
+            help="Activa evaluación de Fidelidad, Relevancia de Contexto y Relevancia de Respuesta usando LLM auditor."
+        )
+        if st.session_state.advanced_mode:
+            st.info(
+                "📊 Se evaluarán 3 métricas de calidad RAG al finalizar. "
+                "Esto toma ~30s adicionales pero proporciona métricas objetivas."
+            )
 
     with st.form("question_form", clear_on_submit=False):
         question = st.text_area(
@@ -152,7 +168,10 @@ def main() -> None:
     render_step_header(1, "Recuperación RAG", done=st.session_state.stage > 1)
     if st.session_state.stage >= 1:
         if st.session_state.stage == 1:
-            st.caption("Recupera contexto científico con la traducción en inglés.")
+            st.caption(
+                "🔍 Recupera contexto científico con Multi-Query Retrieval (MQR): "
+                "genera 3 variantes técnicas en inglés antes de buscar."
+            )
             if st.button("Recuperar contexto y continuar", use_container_width=True):
                 with st.spinner("Recuperando evidencia..."):
                     st.session_state.context = agent.retrieve_context(st.session_state.question_en)
@@ -186,18 +205,91 @@ def main() -> None:
     render_step_header(3, "Evaluación final", done=st.session_state.stage > 3)
     if st.session_state.stage >= 3:
         if st.session_state.stage == 3:
-            st.caption("El juez selecciona la mejor opción de los candidatos generados.")
+            caption_text = "El juez selecciona la mejor opción de los candidatos generados."
+            if st.session_state.advanced_mode:
+                caption_text += " Luego se evaluará la Tríada de RAG."
+            st.caption(caption_text)
             if st.button("Evaluar y finalizar", use_container_width=True):
                 with st.spinner("Evaluando candidatos..."):
                     st.session_state.final_answer = agent.judge_candidates(
                         st.session_state.question_es,
                         st.session_state.candidates,
                     )
+
+                    # Evaluación de Tríada RAG si modo avanzado está activado
+                    if st.session_state.advanced_mode:
+                        with st.spinner("Evaluando Tríada de RAG (esto toma ~30s)..."):
+                            try:
+                                # Extraer docs para evaluación (MQR retorna lista de docs)
+                                docs_list = []
+                                try:
+                                    if hasattr(agent._retriever, 'invoke'):
+                                        docs_list = agent._retriever.invoke(st.session_state.question_en)
+                                except Exception:
+                                    pass
+
+                                # Evaluar tríada si tenemos docs
+                                if docs_list:
+                                    st.session_state.rag_triad_evaluation = agent.evaluate_rag_triad(
+                                        question_spanish=st.session_state.question_es,
+                                        answer=st.session_state.final_answer,
+                                        docs_retrieved=docs_list,
+                                    )
+                            except Exception as e:
+                                st.warning(f"⚠️ Error en evaluación de Tríada: {str(e)}")
+
                 st.session_state.stage = 4
                 st.rerun()
         else:
             st.success("Rutina final lista.")
             st.markdown(st.session_state.final_answer)
+
+            # Mostrar métricas de Tríada RAG si está disponible
+            if st.session_state.rag_triad_evaluation and st.session_state.advanced_mode:
+                st.markdown("---")
+                st.subheader("📊 Evaluación de Calidad RAG (Tríada)")
+
+                eval_data = st.session_state.rag_triad_evaluation
+
+                # Tres columnas con métricas principales
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    rel_contexto = eval_data.get("relevancia_contexto", 0)
+                    st.metric(
+                        "Relevancia Contexto",
+                        f"{rel_contexto}/5",
+                        delta=rel_contexto - 3,
+                    )
+                    st.caption(eval_data.get("justificacion_contexto", ""))
+
+                with col2:
+                    fidelidad = eval_data.get("fidelidad", 0)
+                    st.metric(
+                        "Fidelidad",
+                        f"{fidelidad}/5",
+                        delta=fidelidad - 3,
+                    )
+                    st.caption(eval_data.get("justificacion_fidelidad", ""))
+
+                with col3:
+                    rel_respuesta = eval_data.get("relevancia_respuesta", 0)
+                    st.metric(
+                        "Relevancia Respuesta",
+                        f"{rel_respuesta}/5",
+                        delta=rel_respuesta - 3,
+                    )
+                    st.caption(eval_data.get("justificacion_respuesta", ""))
+
+                # Score general
+                st.markdown("---")
+                score_general = eval_data.get("score_general", 0)
+                st.metric("Score General RAG", f"{score_general}/5")
+
+                # Recomendaciones
+                if "recomendaciones" in eval_data and eval_data["recomendaciones"]:
+                    st.info(f"💡 **Observaciones:** {eval_data['recomendaciones']}")
+
             st.download_button(
                 "Descargar respuesta en Markdown",
                 data=st.session_state.final_answer,
