@@ -1,6 +1,6 @@
 import os
 import json
-import torch
+import time
 import streamlit as st
 
 from agent import CHROMA_PATH, RoutineRAGAgent
@@ -12,6 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# --- CSS PERSONALIZADO ---
 st.markdown(
     """
     <style>
@@ -34,6 +35,7 @@ st.markdown(
         padding: 0.9rem 1rem;
         border-radius: 0 12px 12px 0;
         margin-bottom: 0.75rem;
+        animation: fadeIn 0.5s;
     }
     .tool-header {
         border-left: 5px solid #c27c2f;
@@ -41,6 +43,7 @@ st.markdown(
         padding: 0.9rem 1rem;
         border-radius: 0 12px 12px 0;
         margin-bottom: 0.75rem;
+        animation: fadeIn 0.5s;
     }
     .judge-header {
         border-left: 5px solid #9c27b0;
@@ -48,6 +51,11 @@ st.markdown(
         padding: 0.9rem 1rem;
         border-radius: 0 12px 12px 0;
         margin-bottom: 0.75rem;
+        animation: fadeIn 0.5s;
+    }
+    @keyframes fadeIn {
+        0% { opacity: 0; transform: translateY(10px); }
+        100% { opacity: 1; transform: translateY(0); }
     }
     </style>
     """,
@@ -62,44 +70,19 @@ def init_state() -> None:
     defaults = {
         "question_input": "",
         "final_state": None,
-        "graph_events": [], # Guardaremos los eventos del grafo aquí
+        "graph_events": [],
         "last_question": "",
-        "loading": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
-
-def render_panel(title: str, content: str) -> None:
-    st.markdown(f'<div class="panel-card"><strong>{title}</strong></div>', unsafe_allow_html=True)
-    st.markdown(content)
-
-def run_langgraph(agent: RoutineRAGAgent, question: str):
-    """Ejecuta el grafo y captura los eventos nodo por nodo sin ejecutar dos veces"""
-    estado_inicial = {"question_es": question}
-    eventos = []
-    
-    # Creamos un diccionario para ir acumulando el estado final
-    final_state = dict(estado_inicial)
-    
-    # Capturamos el flujo del grafo en tiempo real
-    for event in agent.graph.stream(estado_inicial, stream_mode="updates"):
-        eventos.append(event)
-        # LangGraph nos da "deltas" (cambios). Los sumamos al estado final.
-        for node_name, node_output in event.items():
-            final_state.update(node_output)
-            
-    return final_state, eventos
 
 def main() -> None:
     init_state()
     agent = get_agent()
 
     st.title("Agentic Routine RAG (LangGraph)")
-    st.write(
-        "Esta interfaz muestra el flujo real del **Grafo de Estados (Reflexion)**: análisis, "
-        "llamada a herramientas (RAG/API), generación y evaluación cíclica del Juez."
-    )
+    st.write("Demostración en vivo del **Patrón de Reflexión**: Ejecución de herramientas, generación y auditoría cíclica.")
 
     if not os.getenv("GROQ_API_KEY"):
         st.warning("No se detectó GROQ_API_KEY en el entorno. Configúrela antes de ejecutar.")
@@ -109,113 +92,110 @@ def main() -> None:
         st.write("Generador/Planificador: qwen/qwen3-32b")
         st.write("Juez/Auditor: llama-3.3-70b-versatile")
         st.write("Embedding: nomic-ai/nomic-embed-text-v1.5")
-        st.markdown("---")
-        st.info("El panel inferior mostrará cómo LangGraph enruta el estado entre los diferentes nodos (analizador, rag, api, generador, auditor).")
 
     with st.form("question_form", clear_on_submit=False):
         question = st.text_area(
             "Pregunta del usuario en español",
-            height=120,
+            height=100,
             value=st.session_state.question_input,
-            placeholder="Ej: Quiero hipertrofia en piernas. No tengo equipo. Me duele la espalda baja.",
+            placeholder="Ej: Quiero hipertrofia en pecho. Obligatoriamente flexiones, pero tengo dolor de hombro.",
         )
         submitted = st.form_submit_button("Ejecutar Grafo de Agentes", use_container_width=True)
 
-    if submitted:
-        st.session_state.question_input = question
+    # ==========================================
+    # ZONA DE EJECUCIÓN DINÁMICA (EFECTO CASCADA)
+    # ==========================================
+    if submitted and question.strip():
         st.session_state.last_question = question.strip()
-        st.session_state.loading = True
+        st.session_state.graph_events = []
         
-        with st.spinner("LangGraph está orquestando los nodos..."):
-            final_state, events = run_langgraph(agent, question)
-            st.session_state.final_state = final_state 
-            st.session_state.graph_events = events
+        estado_inicial = {"question_es": question.strip(), "iterations": 0}
+        final_state = dict(estado_inicial)
+
+        st.markdown("---")
+        
+        # 1. Creamos "Contenedores Vacíos" que iremos actualizando en vivo
+        metrics_placeholder = st.empty()
+        st.subheader("Traza de Ejecución en Vivo")
+        trace_container = st.container()
+        final_result_placeholder = st.empty()
+
+        # 2. Iteramos el grafo en tiempo real
+        idx = 1
+        for event in agent.graph.stream(estado_inicial, stream_mode="updates"):
+            st.session_state.graph_events.append(event)
             
-        st.session_state.loading = False
-        st.rerun()
-
-    if not st.session_state.last_question:
-        st.info("Escribe una petición y presiona 'Ejecutar Grafo de Agentes' para iniciar.")
-        return
-
-    state = st.session_state.final_state
-    events = st.session_state.graph_events
-    
-    if not state:
-        st.info("Aún no hay ejecución guardada.")
-        return
-
-    # --- MÉTRICAS SUPERIORES ---
-    progress_cols = st.columns(4)
-    progress_cols[0].metric("Iteraciones de Generación", state.get("iterations", 1))
-    progress_cols[1].metric("Evaluación del Juez", "Segura ✅" if state.get("is_safe") else "Insegura ❌")
-    progress_cols[2].metric("Herramienta RAG", "Ejecutada")
-    progress_cols[3].metric("Herramienta API", "Ejecutada")
-
-    st.markdown("---")
-
-    # --- ANÁLISIS DE ENTRADA ---
-    left, right = st.columns([1, 1])
-    with left:
-        st.subheader("Entrada y Perfilamiento")
-        render_panel("Pregunta Original (ES)", st.session_state.last_question)
-        st.markdown(f"**Traducción MQR (EN):** `{state.get('question_en', '')}`")
-        if state.get("safety_warning"):
-            st.warning("⚠️ **Alerta de Salud Detectada por el Analizador**")
-
-    with right:
-        st.subheader("Auditoría Final (Juez Llama 70B)")
-        st.caption("Feedback interno generado por el nodo 'auditor' antes del renderizado final.")
-        if state.get("is_safe"):
-            st.success(state.get("audit_feedback", "Aprobado por el juez."))
-        else:
-            st.error(f"Rechazado en iteración. Feedback: {state.get('audit_feedback', '')}")
-
-    st.markdown("---")
-    
-    # --- TRAZA DEL GRAFO (LANGGRAPH) ---
-    st.subheader("Traza de Ejecución (Nodos de LangGraph)")
-    st.caption("Cada bloque muestra la mutación del Estado Global (State) al pasar por un nodo.")
-    
-    for idx, event in enumerate(events, 1):
-        for node_name, node_output in event.items():
-            if node_name == "analizador":
-                st.markdown(f'<div class="node-header"><strong>Nodo {idx}: Analizador</strong></div>', unsafe_allow_html=True)
-                st.write("El agente tradujo la consulta y detectó las alertas de seguridad.")
-            
-            elif node_name == "rag":
-                st.markdown(f'<div class="tool-header"><strong>Nodo {idx}: Herramienta RAG (ChromaDB)</strong></div>', unsafe_allow_html=True)
-                with st.expander("Ver Contexto Científico Recuperado"):
-                    st.text_area("Contexto Científico", value=node_output.get("scientific_context", ""), height=150, disabled=True, label_visibility="collapsed")
-            
-            elif node_name == "api":
-                st.markdown(f'<div class="tool-header"><strong>Nodo {idx}: Herramienta API (Wger/Fallback)</strong></div>', unsafe_allow_html=True)
-                with st.expander("Ver Catálogo de Ejercicios Recuperado"):
-                    st.text_area("Catálogo de Ejercicios (API Wger)", value=node_output.get("wger_context", ""), height=150, disabled=True, label_visibility="collapsed")
-            
-            elif node_name == "generador":
-                st.markdown(f'<div class="node-header"><strong>Nodo {idx}: Generador (Iteración {node_output.get("iterations", 1)})</strong></div>', unsafe_allow_html=True)
-                with st.expander("Ver Borrador de la Rutina"):
-                    st.markdown(node_output.get("draft_routine", ""))
+            for node_name, node_output in event.items():
+                final_state.update(node_output)
+                
+                # A) Actualizamos los contadores de arriba (Métricas) en vivo
+                with metrics_placeholder.container():
+                    cols = st.columns(4)
+                    cols[0].metric("Iteraciones", final_state.get("iterations", 0))
                     
-            elif node_name == "auditor":
-                st.markdown(f'<div class="judge-header"><strong>⚖️ Nodo {idx}: Auditor de Seguridad Clínica</strong></div>', unsafe_allow_html=True)
-                st.write(f"**Veredicto:** {'Aprobado ✅' if node_output.get('is_safe') else 'Rechazado ❌'}")
-                st.write(f"**Feedback inyectado al estado:** {node_output.get('audit_feedback')}")
+                    is_safe = final_state.get("is_safe")
+                    if is_safe is None:
+                        juez_txt = "⏳ Evaluando..."
+                    else:
+                        juez_txt = "Segura ✅" if is_safe else "Insegura ❌"
+                    cols[1].metric("Veredicto Juez", juez_txt)
+                    
+                    cols[2].metric("Herramienta RAG", "Ejecutada 🔍" if "scientific_context" in final_state else "Esperando...")
+                    cols[3].metric("Herramienta API", "Ejecutada 🏋️" if "wger_context" in final_state else "Esperando...")
 
-    st.markdown("---")
-    
-    # --- RESULTADO FINAL ---
-    st.subheader("Rutina Final Entregada")
-    st.markdown(state.get("final_answer", ""))
+                # B) Imprimimos el nodo en cascada
+                with trace_container:
+                    if node_name == "analizador":
+                        st.markdown(f'<div class="node-header"><strong>🧠 Nodo {idx}: Analizador</strong></div>', unsafe_allow_html=True)
+                        st.info(f"**Traducción MQR (EN):** {node_output.get('question_en', '')}")
+                        if node_output.get("safety_warning"):
+                            st.warning("⚠️ Alerta Clínica Detectada")
+                            
+                    elif node_name == "rag":
+                        st.markdown(f'<div class="tool-header"><strong>📚 Nodo {idx}: Herramienta RAG (ChromaDB)</strong></div>', unsafe_allow_html=True)
+                        with st.expander("Ver Contexto Científico Recuperado"):
+                            st.caption(node_output.get("scientific_context", ""))
+                            
+                    elif node_name == "api":
+                        st.markdown(f'<div class="tool-header"><strong>🔌 Nodo {idx}: Herramienta API (Wger/Fallback)</strong></div>', unsafe_allow_html=True)
+                        with st.expander("Ver Catálogo de Ejercicios"):
+                            st.caption(node_output.get("wger_context", ""))
+                            
+                    elif node_name == "generador":
+                        st.markdown(f'<div class="node-header"><strong>⚡ Nodo {idx}: Generador (Iteración {final_state.get("iterations", 1)})</strong></div>', unsafe_allow_html=True)
+                        with st.expander("Ver Borrador de la Rutina (Qwen)"):
+                            st.markdown(node_output.get("draft_routine", "Rutina generada."))
+                            
+                    elif node_name == "auditor":
+                        st.markdown(f'<div class="judge-header"><strong>⚖️ Nodo {idx}: Auditor de Seguridad (Llama 70B)</strong></div>', unsafe_allow_html=True)
+                        if node_output.get("is_safe"):
+                            st.success("✅ Veredicto: Rutina Aprobada.")
+                        else:
+                            st.error(f"❌ Veredicto: RECHAZADA. \n\n**Feedback inyectado:** {node_output.get('audit_feedback', '')}")
+                    
+                    elif node_name == "formateador":
+                        st.markdown(f'<div class="node-header"><strong>✨ Nodo {idx}: Formateador</strong></div>', unsafe_allow_html=True)
+                        st.write("Ensamblando entrega final...")
 
-    st.download_button(
-        "Descargar rutina en Markdown",
-        data=state.get("final_answer", ""),
-        file_name="rutina_final.md",
-        mime="text/markdown",
-        use_container_width=True,
-    )
+                idx += 1
+                time.sleep(0.4) # Pequeña pausa dramática para que el video se vea fluido
+
+        # 3. Al terminar el ciclo, guardamos en session y mostramos la rutina final
+        st.session_state.final_state = final_state
+        
+        with final_result_placeholder.container():
+            st.markdown("---")
+            st.subheader("Rutina Final Entregada")
+            st.markdown(final_state.get("final_answer", ""))
+
+    # ==========================================
+    # RENDERIZADO ESTÁTICO (Si ya se ejecutó antes)
+    # ==========================================
+    elif st.session_state.final_state and not submitted:
+        state = st.session_state.final_state
+        st.success("Ejecución previa cargada. (Ejecute un nuevo prompt para ver la traza en vivo).")
+        st.subheader("Rutina Final Entregada")
+        st.markdown(state.get("final_answer", ""))
 
 if __name__ == "__main__":
     main()
